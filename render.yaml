@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: bs-server
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LICENSE_KEYS
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: SESSION_TTL_SECONDS
+        value: "172800"
