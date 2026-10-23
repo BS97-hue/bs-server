@@ -16,3 +16,9 @@ services:
         sync: false
       - key: SESSION_TTL_SECONDS
         value: "172800"
+      - key: SESSION_SECRET
+        sync: false
+      - key: WORKER_POOL_JSON
+        sync: false
+      - key: DEBUG_LOGGING
+        value: "false"
