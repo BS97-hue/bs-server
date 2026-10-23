@@ -10,6 +10,7 @@ const port = Number(process.env.PORT || 10000);
 const sessionTtl = Number(process.env.SESSION_TTL_SECONDS || 172800);
 const sessions = new Map();
 const state = new Map();
+const claimedWorkers = new Map();
 const startedAt = new Date().toISOString();
 
 app.set('trust proxy', 1);
@@ -167,6 +168,7 @@ app.post('/srv/worker_api/release.php', (req, res) => {
   const session = authOrError(req, res, 'release.php');
   if (!session) return;
   const s = deviceState(session.deviceId);
+  claimedWorkers.delete(clean(req.body.worker_id));
   s.workers = s.workers.filter((worker) => String(worker.worker_id) !== clean(req.body.worker_id));
   return json(res, { status: true, success: true, message: 'Worker released', workers: s.workers });
 });
@@ -174,6 +176,7 @@ app.post('/release.php', (req, res) => {
   const session = authOrError(req, res, 'release.php');
   if (!session) return;
   const s = deviceState(session.deviceId);
+  claimedWorkers.delete(clean(req.body.worker_id));
   s.workers = s.workers.filter((worker) => String(worker.worker_id) !== clean(req.body.worker_id));
   return json(res, { status: true, success: true, message: 'Worker released', workers: s.workers });
 });
@@ -182,8 +185,10 @@ function claimWorker(req, res) {
   if (!session) return;
   const pool = workerPool();
   if (!pool.length) return json(res, { status: true, available: false, message: 'No workers available in pool' });
-  const worker = pool[0];
+  const worker = pool.find((candidate) => !claimedWorkers.has(String(candidate.worker_id)));
+  if (!worker) return json(res, { status: true, available: false, message: 'No workers available in pool' });
   const claimToken = crypto.randomBytes(24).toString('hex');
+  claimedWorkers.set(String(worker.worker_id), { deviceId: session.deviceId, claimToken });
   return json(res, { status: true, available: true, claim_token: claimToken, worker });
 }
 app.post('/srv/worker_api/claim.php', claimWorker);
