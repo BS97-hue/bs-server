@@ -220,23 +220,36 @@ function claimWorker(req, res) {
   const session = authOrError(req, res, 'claim.php');
   if (!session) return;
   const pool = workerPool();
-  if (!pool.length) return json(res, { status: true, available: false, message: 'No workers available in pool' });
-  const worker = pool.find((candidate) => !claimedWorkers.has(String(candidate.worker_id)));
-  if (!worker) return json(res, { status: true, available: false, message: 'No workers available in pool' });
+  if (!pool.length) {
+    logEvent('claim_result', { available: false, pool_count: 0, reason: 'empty_pool' });
+    return json(res, { status: true, available: false, message: 'No workers available in pool' });
+  }
+  const worker = pool.find((candidate) => {
+    const workerId = Number(candidate?.worker_id ?? candidate?.id);
+    const cityId = clean(candidate?.city_id || candidate?.cityId);
+    const tsToken = clean(candidate?.ts_token || candidate?.tsToken);
+    return Number.isInteger(workerId) && workerId > 0 && cityId !== '' && tsToken !== '' && !claimedWorkers.has(String(workerId));
+  });
+  if (!worker) {
+    logEvent('claim_result', { available: false, pool_count: pool.length, reason: 'no_valid_unclaimed_worker' });
+    return json(res, { status: true, success: true, available: false, message: 'No valid workers available in pool' });
+  }
   const claimToken = crypto.randomBytes(24).toString('hex');
-  claimedWorkers.set(String(worker.worker_id), { deviceId: session.deviceId, claimToken });
+  const workerId = Number(worker.worker_id ?? worker.id);
+  claimedWorkers.set(String(workerId), { deviceId: session.deviceId, claimToken });
   // The APK reads claim_token from WorkerItem.fromJson(worker). Keep it
   // inside worker as well as at the top level for compatibility.
   const responseWorker = {
     ...worker,
-    worker_id: Number(worker.worker_id || worker.id || 0),
+    worker_id: workerId,
     claim_token: claimToken,
     city_id: clean(worker.city_id || worker.cityId),
     ts_bver: clean(worker.ts_bver || worker.bver || '39.0.5'),
     ts_fver: clean(worker.ts_fver || worker.fver || '3900'),
     ts_token: clean(worker.ts_token || worker.tsToken),
   };
-  return json(res, { status: true, available: true, claim_token: claimToken, worker: responseWorker });
+  logEvent('claim_result', { available: true, pool_count: pool.length, worker_id: responseWorker.worker_id, has_city_id: Boolean(responseWorker.city_id), has_ts_token: Boolean(responseWorker.ts_token) });
+  return json(res, { status: true, success: true, available: true, claim_token: claimToken, worker: responseWorker });
 }
 app.post('/srv/worker_api/claim.php', claimWorker);
 app.post('/claim.php', claimWorker);
