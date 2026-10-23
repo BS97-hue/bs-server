@@ -15,6 +15,10 @@ const startedAt = new Date().toISOString();
 app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 app.use(express.json({ limit: '2mb' }));
+app.use((req, _res, next) => {
+  if (req.url.startsWith('//')) req.url = req.url.replace(/^\/+/, '/');
+  next();
+});
 
 function clean(value) { return String(value ?? '').trim(); }
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
@@ -99,7 +103,7 @@ function addLog(s, message) { s.logs.push(`${new Date().toISOString()} ${message
 app.get('/healthz', (_req, res) => json(res, { ok: true, service: 'bs-server', started_at: startedAt, uptime_seconds: Math.floor(process.uptime()) }));
 app.get('/', (_req, res) => json(res, { service: 'bs-server', api: 'Dyluc Auto Regata compatible', health: '/healthz' }));
 
-app.post('/srv/check_license.php', (req, res) => {
+function checkLicense(req, res) {
   const key = clean(req.body.license_key).toLowerCase();
   const deviceId = clean(req.body.device_id);
   if (!key || !deviceId) return error(res, 'license_key and device_id are required');
@@ -118,7 +122,11 @@ app.post('/srv/check_license.php', (req, res) => {
     license_features: { auto_regata: true },
     server_proof_v: 0
   });
-});
+}
+
+app.post('/srv/check_license.php', checkLicense);
+app.post('/c/12345', checkLicense);
+app.post('/c/*', checkLicense);
 
 function autoRegata(req, res) {
   const endpoint = 'auto_regata.php';
@@ -144,7 +152,16 @@ function autoRegata(req, res) {
 
 app.post('/srv/backup_api/auto_regata.php', upload.any(), autoRegata);
 app.get('/srv/backup_api/auto_regata.php', autoRegata);
+app.post('/auto_regata.php', upload.any(), autoRegata);
+app.get('/auto_regata.php', autoRegata);
 app.post('/srv/worker_api/release.php', (req, res) => {
+  const session = authOrError(req, res, 'release.php');
+  if (!session) return;
+  const s = deviceState(session.deviceId);
+  s.workers = s.workers.filter((worker) => String(worker.worker_id) !== clean(req.body.worker_id));
+  return json(res, { status: true, success: true, message: 'Worker released', workers: s.workers });
+});
+app.post('/release.php', (req, res) => {
   const session = authOrError(req, res, 'release.php');
   if (!session) return;
   const s = deviceState(session.deviceId);
