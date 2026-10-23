@@ -131,7 +131,7 @@ function deviceState(deviceId) {
   return state.get(deviceId);
 }
 function result(s, message = 'OK') {
-  return { status: true, success: true, message, account_count: s.account_count, prepared_count: s.workers.length, master_ready: s.master_ready, master_clan_id: '', master_uploaded_at: '', job: s.job, logs: s.logs.slice(-180), workers: s.workers };
+  return { status: true, success: true, message, account_count: s.account_count, prepared_count: s.workers.length, master_ready: s.master_ready, master_clan_id: '', master_uploaded_at: '', master: { ready: s.master_ready, clan_id: '', uploaded_at: '' }, master_meta: {}, job: s.job, logs: s.logs.slice(-180), workers: s.workers };
 }
 function addLog(s, message) { s.logs.push(`${new Date().toISOString()} ${message}`); s.logs = s.logs.slice(-500); s.job.last_message = message; }
 
@@ -172,6 +172,7 @@ function checkLicense(req, res) {
 app.post('/srv/check_license.php', checkLicense);
 app.post('/c/12345', checkLicense);
 app.post('/c/*', checkLicense);
+app.all('/srv/regataonly_api/check_update.php', (_req, res) => json(res, { status: true, success: true, update_available: false, force_update: false, message: 'No update available' }));
 
 function autoRegata(req, res) {
   const endpoint = 'auto_regata.php';
@@ -253,6 +254,21 @@ function claimWorker(req, res) {
 }
 app.post('/srv/worker_api/claim.php', claimWorker);
 app.post('/claim.php', claimWorker);
+function consumeWorker(req, res) {
+  const session = authOrError(req, res, 'consume.php');
+  if (!session) return;
+  const workerId = clean(req.body.worker_id);
+  const claimToken = clean(req.body.claim_token);
+  const claim = claimedWorkers.get(workerId);
+  if (!claim || claim.deviceId !== session.deviceId || claim.claimToken !== claimToken) return error(res, 'Invalid or expired worker claim', 409);
+  claimedWorkers.delete(workerId);
+  const s = deviceState(session.deviceId);
+  s.workers = s.workers.filter((worker) => String(worker.worker_id) !== workerId);
+  addLog(s, `Worker consumed: ${workerId}`);
+  return json(res, { status: true, success: true, message: 'Worker consumed', workers: s.workers });
+}
+app.post('/srv/worker_api/consume.php', consumeWorker);
+app.post('/consume.php', consumeWorker);
 
 app.use((err, _req, res, _next) => { console.error(err); error(res, 'Internal server error', 500); });
 app.listen(port, '0.0.0.0', () => console.log(`bs-server listening on ${port}`));
