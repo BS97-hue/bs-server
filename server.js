@@ -100,6 +100,15 @@ function result(s, message = 'OK') {
 }
 function addLog(s, message) { s.logs.push(`${new Date().toISOString()} ${message}`); s.logs = s.logs.slice(-500); s.job.last_message = message; }
 
+function workerPool() {
+  try {
+    const parsed = JSON.parse(process.env.WORKER_POOL_JSON || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 app.get('/healthz', (_req, res) => json(res, { ok: true, service: 'bs-server', started_at: startedAt, uptime_seconds: Math.floor(process.uptime()) }));
 app.get('/', (_req, res) => json(res, { service: 'bs-server', api: 'Dyluc Auto Regata compatible', health: '/healthz' }));
 
@@ -168,6 +177,17 @@ app.post('/release.php', (req, res) => {
   s.workers = s.workers.filter((worker) => String(worker.worker_id) !== clean(req.body.worker_id));
   return json(res, { status: true, success: true, message: 'Worker released', workers: s.workers });
 });
+function claimWorker(req, res) {
+  const session = authOrError(req, res, 'claim.php');
+  if (!session) return;
+  const pool = workerPool();
+  if (!pool.length) return json(res, { status: true, available: false, message: 'No workers available in pool' });
+  const worker = pool[0];
+  const claimToken = crypto.randomBytes(24).toString('hex');
+  return json(res, { status: true, available: true, claim_token: claimToken, worker });
+}
+app.post('/srv/worker_api/claim.php', claimWorker);
+app.post('/claim.php', claimWorker);
 
 app.use((err, _req, res, _next) => { console.error(err); error(res, 'Internal server error', 500); });
 app.listen(port, '0.0.0.0', () => console.log(`bs-server listening on ${port}`));
