@@ -8,6 +8,7 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const port = Number(process.env.PORT || 10000);
 const sessionTtl = Number(process.env.SESSION_TTL_SECONDS || 172800);
+const debugLogging = clean(process.env.DEBUG_LOGGING).toLowerCase() === 'true';
 const sessions = new Map();
 const state = new Map();
 const claimedWorkers = new Map();
@@ -20,11 +21,44 @@ app.use((req, _res, next) => {
   if (req.url.startsWith('//')) req.url = req.url.replace(/^\/+/, '/');
   next();
 });
+app.use((req, res, next) => {
+  const started = Date.now();
+  res.on('finish', () => logEvent('http_request', {
+    method: req.method,
+    path: req.path,
+    status_code: res.statusCode,
+    duration_ms: Date.now() - started,
+    action: clean(req.body?.action) || undefined,
+    body: safeBody(req.body),
+  }));
+  next();
+});
 
 function clean(value) { return String(value ?? '').trim(); }
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
 function json(res, body, status = 200) { return res.status(status).type('application/json').send(JSON.stringify(body)); }
 function error(res, message, status = 400) { return json(res, { status: false, success: false, message }, status); }
+function logEvent(event, fields = {}) {
+  if (!debugLogging) return;
+  console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...fields }));
+}
+
+function safeBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
+  const hidden = new Set(['token', 'authorization', 'license_key', 'device_id', 'ts', 'nonce', 'signature', 'claim_token', 'ts_token', 'savecity_data', 'master_file']);
+  const output = {};
+  for (const [key, value] of Object.entries(body)) {
+    const normalized = key.toLowerCase();
+    if (hidden.has(normalized) || normalized.includes('password') || normalized.includes('secret')) {
+      output[key] = '[redacted]';
+    } else if (typeof value === 'string' && value.length > 256) {
+      output[key] = `[string:${value.length} chars]`;
+    } else {
+      output[key] = value;
+    }
+  }
+  return output;
+}
 
 function configuredLicenses() {
   return clean(process.env.LICENSE_KEYS).split(',').map((entry) => entry.trim()).filter(Boolean).map((entry) => {
@@ -116,6 +150,7 @@ app.get('/', (_req, res) => json(res, { service: 'bs-server', api: 'Dyluc Auto R
 function checkLicense(req, res) {
   const key = clean(req.body.license_key).toLowerCase();
   const deviceId = clean(req.body.device_id);
+  logEvent('license_check', { has_license_key: Boolean(key), has_device_id: Boolean(deviceId) });
   if (!key || !deviceId) return error(res, 'license_key and device_id are required');
   const license = findLicense(key);
   if (!license || license.expired) return json(res, { status: false, success: false, message: license?.expired ? 'License expired' : 'Invalid license' }, 403);
@@ -144,6 +179,7 @@ function autoRegata(req, res) {
   if (!session) return;
   const s = deviceState(session.deviceId);
   const action = clean(req.body.action || 'status');
+  logEvent('auto_regata_action', { action });
   if (action === 'clear_log') { s.logs = []; return json(res, result(s, 'Logs cleared successfully.')); }
   if (action === 'status') return json(res, result(s));
   if (action === 'prepare_workers') {
@@ -189,7 +225,18 @@ function claimWorker(req, res) {
   if (!worker) return json(res, { status: true, available: false, message: 'No workers available in pool' });
   const claimToken = crypto.randomBytes(24).toString('hex');
   claimedWorkers.set(String(worker.worker_id), { deviceId: session.deviceId, claimToken });
-  return json(res, { status: true, available: true, claim_token: claimToken, worker });
+  // The APK reads claim_token from WorkerItem.fromJson(worker). Keep it
+  // inside worker as well as at the top level for compatibility.
+  const responseWorker = {
+    ...worker,
+    worker_id: Number(worker.worker_id || worker.id || 0),
+    claim_token: claimToken,
+    city_id: clean(worker.city_id || worker.cityId),
+    ts_bver: clean(worker.ts_bver || worker.bver || '39.0.5'),
+    ts_fver: clean(worker.ts_fver || worker.fver || '3900'),
+    ts_token: clean(worker.ts_token || worker.tsToken),
+  };
+  return json(res, { status: true, available: true, claim_token: claimToken, worker: responseWorker });
 }
 app.post('/srv/worker_api/claim.php', claimWorker);
 app.post('/claim.php', claimWorker);
