@@ -24,6 +24,14 @@ app.use((req, _res, next) => {
 
 function clean(value) { return String(value ?? '').trim(); }
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
+function timestampSeconds(value) {
+  const text = clean(value);
+  if (!/^\d+$/.test(text)) return null;
+  const number = Number(text);
+  if (!Number.isSafeInteger(number)) return null;
+  // Accept Unix seconds and Unix milliseconds without changing the signed value.
+  return text.length >= 12 ? Math.floor(number / 1000) : number;
+}
 function json(res, body, status = 200) { return res.status(status).type('application/json').send(JSON.stringify(body)); }
 function error(res, message, status = 400) { return json(res, { status: false, success: false, message }, status); }
 function cookieValue(req, name) {
@@ -112,7 +120,8 @@ function verifyAuth(req, endpoint) {
   const signature = clean(req.get('X-NR-Signature') || req.body?.signature);
   const session = sessionFor(token);
   if (!session || session.licenseKey !== license.toLowerCase() || session.deviceId !== deviceId) return { ok: false, message: 'Invalid or expired session' };
-  if (!/^\d+$/.test(ts) || Math.abs(nowSeconds() - Number(ts)) > 300) return { ok: false, message: 'Request timestamp expired' };
+  const requestSeconds = timestampSeconds(ts);
+  if (requestSeconds === null || Math.abs(nowSeconds() - requestSeconds) > 300) return { ok: false, message: 'Request timestamp expired' };
   if (!nonce || !/^[a-f0-9]{16,128}$/i.test(nonce)) return { ok: false, message: 'Invalid request nonce' };
   const expected = crypto.createHmac('sha256', token).update(signatureMessage(req.method, endpoint, ts, nonce, license, deviceId)).digest('hex');
   const provided = Buffer.from(signature.toLowerCase());
