@@ -9,6 +9,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 
 const port = Number(process.env.PORT || 10000);
 const sessionTtl = Number(process.env.SESSION_TTL_SECONDS || 172800);
 const sessions = new Map();
+const adminSessions = new Map();
 const state = new Map();
 const claimedWorkers = new Map();
 const startedAt = new Date().toISOString();
@@ -25,6 +26,33 @@ function clean(value) { return String(value ?? '').trim(); }
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
 function json(res, body, status = 200) { return res.status(status).type('application/json').send(JSON.stringify(body)); }
 function error(res, message, status = 400) { return json(res, { status: false, success: false, message }, status); }
+function cookieValue(req, name) {
+  const header = req.get('Cookie') || '';
+  const match = header.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`));
+  return match ? decodeURIComponent(match.slice(name.length + 1)) : '';
+}
+function adminOk(req) { return adminSessions.has(cookieValue(req, 'bs_admin')); }
+function supabaseConfigured() { return Boolean(clean(process.env.SUPABASE_URL) && clean(process.env.SUPABASE_SERVICE_ROLE_KEY)); }
+async function supabaseRequest(pathname, options = {}) {
+  if (!supabaseConfigured()) throw new Error('Supabase is not configured');
+  const response = await fetch(`${clean(process.env.SUPABASE_URL).replace(/\/$/, '')}/rest/v1/${pathname}`, {
+    ...options,
+    headers: {
+      apikey: clean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+      Authorization: `Bearer ${clean(process.env.SUPABASE_SERVICE_ROLE_KEY)}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+  const text = await response.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch (_) { body = { raw: text.slice(0, 200) }; }
+  if (!response.ok) throw new Error(`Supabase HTTP ${response.status}`);
+  return body;
+}
+function safeLicense(row) {
+  return { id: row.id, license_key: row.license_key, device_id: row.device_id || '', expires_at: row.expires_at, active: Boolean(row.active), notes: row.notes || '', last_used_at: row.last_used_at || null, created_at: row.created_at || null };
+}
 
 function configuredLicenses() {
   return clean(process.env.LICENSE_KEYS).split(',').map((entry) => entry.trim()).filter(Boolean).map((entry) => {
@@ -35,8 +63,15 @@ function configuredLicenses() {
   });
 }
 
-function findLicense(key) {
+async function findLicense(key) {
   const normalized = clean(key).toLowerCase();
+  if (supabaseConfigured()) {
+    const rows = await supabaseRequest(`bs_licenses?select=*&license_key=eq.${encodeURIComponent(normalized.toUpperCase())}&limit=1`);
+    const item = Array.isArray(rows) ? rows[0] : null;
+    if (!item) return null;
+    const expires = Date.parse(item.expires_at);
+    return { key: item.license_key.toLowerCase(), expiry: item.expires_at, expired: !item.active || !Number.isFinite(expires) || expires <= Date.now(), deviceId: item.device_id || '', row: item };
+  }
   const item = configuredLicenses().find((candidate) => candidate.key === normalized);
   if (!item) return null;
   const expires = Date.parse(item.expiry);
@@ -163,12 +198,39 @@ function workerPool() {
 app.get('/healthz', (_req, res) => json(res, { ok: true, service: 'bs-server', started_at: startedAt, uptime_seconds: Math.floor(process.uptime()) }));
 app.get('/', (_req, res) => json(res, { service: 'bs-server', api: 'Dyluc Auto Regata compatible', health: '/healthz' }));
 
-function checkLicense(req, res) {
+const adminPage = `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BS License Admin</title><style>body{font-family:Arial,sans-serif;background:#101827;color:#eef2ff;margin:0;padding:24px}main{max-width:1000px;margin:auto}section{background:#182338;border:1px solid #2d3b57;border-radius:14px;padding:18px;margin:14px 0}input,button{font:inherit;border-radius:9px;padding:10px;margin:4px;border:1px solid #425273}input{background:#0f1727;color:#fff}button{background:#2563eb;color:white;cursor:pointer}button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #33415d;text-align:right;font-size:14px}.muted{color:#9fb0ca}.hidden{display:none}.msg{padding:10px;color:#fbbf24}</style></head><body><main><h1>إدارة تراخيص BS</h1><section id="login"><p class="muted">أدخل كلمة مرور الإدارة.</p><input id="password" type="password" placeholder="كلمة المرور"><button onclick="login()">دخول</button><div id="loginMsg" class="msg"></div></section><section id="panel" class="hidden"><div><button onclick="loadLicenses()">تحديث</button><button class="danger" onclick="logout()">خروج</button></div><h2>إضافة ترخيص</h2><input id="key" placeholder="BS-XXXXXX"><input id="expires" type="datetime-local"><input id="device" placeholder="Device ID اختياري"><input id="notes" placeholder="ملاحظات"><button onclick="createLicense()">إضافة</button><div id="msg" class="msg"></div><h2>التراخيص</h2><table><thead><tr><th>الترخيص</th><th>الجهاز</th><th>الانتهاء</th><th>الحالة</th><th>إجراء</th></tr></thead><tbody id="rows"></tbody></table></section></main><script>const $=id=>document.getElementById(id);async function api(url,opt={}){const r=await fetch(url,{credentials:'same-origin',...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.message||'فشل الطلب');return d}function show(m){$('msg').textContent=m}async function login(){try{await api('/admin/api/login',{method:'POST',body:JSON.stringify({password:$('password').value})});$('login').classList.add('hidden');$('panel').classList.remove('hidden');loadLicenses()}catch(e){$('loginMsg').textContent=e.message}}async function logout(){await api('/admin/api/logout',{method:'POST'});location.reload()}async function loadLicenses(){try{const d=await api('/admin/api/licenses');$('rows').innerHTML='';for(const x of d.licenses){const tr=document.createElement('tr');const vals=[x.license_key,x.device_id||'-',new Date(x.expires_at).toLocaleString(),x.active?'فعال':'متوقف'];for(const v of vals){const td=document.createElement('td');td.textContent=v;tr.appendChild(td)}const td=document.createElement('td');const b=document.createElement('button');b.textContent=x.active?'تعطيل':'تفعيل';b.onclick=()=>toggle(x.id,!x.active);td.appendChild(b);const del=document.createElement('button');del.textContent='حذف';del.className='danger';del.onclick=()=>removeLicense(x.id);td.appendChild(del);tr.appendChild(td);$('rows').appendChild(tr)}}catch(e){show(e.message)}}async function createLicense(){try{let key=$('key').value.trim().toUpperCase();if(!key)key='BS-'+crypto.randomUUID().replaceAll('-','').slice(0,12).toUpperCase();if(!/^BS-[A-Z0-9]+$/.test(key))throw Error('الترخيص يجب أن يبدأ بـ BS-');const exp=$('expires').value?new Date($('expires').value).toISOString():'2099-12-31T23:59:59.000Z';await api('/admin/api/licenses',{method:'POST',body:JSON.stringify({license_key:key,expires_at:exp,device_id:$('device').value.trim(),notes:$('notes').value.trim()})});show('تمت الإضافة');loadLicenses()}catch(e){show(e.message)}}async function toggle(id,active){try{await api('/admin/api/licenses/'+id,{method:'PATCH',body:JSON.stringify({active})});loadLicenses()}catch(e){show(e.message)}}async function removeLicense(id){if(!confirm('حذف الترخيص؟'))return;try{await api('/admin/api/licenses/'+id,{method:'DELETE'});loadLicenses()}catch(e){show(e.message)}}loadLicenses().catch(()=>{})</script></body></html>`;
+app.get('/admin', (_req, res) => res.type('html').send(adminPage));
+app.post('/admin/api/login', (req, res) => {
+  if (clean(req.body.password) !== clean(process.env.ADMIN_PASSWORD || 'BS2973')) return error(res, 'كلمة المرور غير صحيحة', 401);
+  const token = crypto.randomBytes(32).toString('hex');
+  adminSessions.set(token, Date.now() + 8 * 60 * 60 * 1000);
+  res.set('Set-Cookie', `bs_admin=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=28800`);
+  return json(res, { ok: true });
+});
+app.post('/admin/api/logout', (req, res) => { adminSessions.delete(cookieValue(req, 'bs_admin')); res.set('Set-Cookie', 'bs_admin=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0'); return json(res, { ok: true }); });
+app.use('/admin/api', (req, res, next) => { if (!adminOk(req)) return error(res, 'Admin login required', 401); next(); });
+app.get('/admin/api/licenses', async (_req, res) => { try { const rows = await supabaseRequest('bs_licenses?select=*&order=id.desc'); return json(res, { licenses: rows.map(safeLicense) }); } catch (_) { return error(res, 'Supabase is not configured or unavailable', 503); } });
+app.post('/admin/api/licenses', async (req, res) => {
+  const key = clean(req.body.license_key).toUpperCase();
+  const expires = clean(req.body.expires_at);
+  if (!/^BS-[A-Z0-9]+$/.test(key)) return error(res, 'license_key must start with BS-');
+  if (!expires || !Number.isFinite(Date.parse(expires))) return error(res, 'expires_at is required');
+  try { const rows = await supabaseRequest('bs_licenses', { method: 'POST', headers: { Prefer: 'return=representation' }, body: JSON.stringify({ license_key: key, expires_at: new Date(expires).toISOString(), device_id: clean(req.body.device_id) || null, notes: clean(req.body.notes) || null, active: true }) }); return json(res, { license: safeLicense(rows[0]) }, 201); } catch (_) { return error(res, 'تعذر إنشاء الترخيص', 400); }
+});
+app.patch('/admin/api/licenses/:id', async (req, res) => { try { const rows = await supabaseRequest(`bs_licenses?id=eq.${encodeURIComponent(req.params.id)}`, { method: 'PATCH', headers: { Prefer: 'return=representation' }, body: JSON.stringify({ active: Boolean(req.body.active) }) }); return json(res, { license: safeLicense(rows[0]) }); } catch (_) { return error(res, 'تعذر تحديث الترخيص', 400); } });
+app.delete('/admin/api/licenses/:id', async (req, res) => { try { await supabaseRequest(`bs_licenses?id=eq.${encodeURIComponent(req.params.id)}`, { method: 'DELETE' }); return json(res, { ok: true }); } catch (_) { return error(res, 'تعذر حذف الترخيص', 400); } });
+
+async function checkLicense(req, res) {
   const key = clean(req.body.license_key).toLowerCase();
   const deviceId = clean(req.body.device_id);
   if (!key || !deviceId) return error(res, 'license_key and device_id are required');
-  const license = findLicense(key);
+  let license;
+  try { license = await findLicense(key); } catch (_) { return error(res, 'License database unavailable', 503); }
   if (!license || license.expired) return json(res, { status: false, success: false, message: license?.expired ? 'License expired' : 'Invalid license' }, 403);
+  if (license.deviceId && license.deviceId !== deviceId) return json(res, { status: false, success: false, message: 'License is assigned to another device' }, 403);
+  if (supabaseConfigured()) {
+    try { await supabaseRequest(`bs_licenses?license_key=eq.${encodeURIComponent(license.key.toUpperCase())}`, { method: 'PATCH', body: JSON.stringify({ device_id: deviceId, last_used_at: new Date().toISOString() }) }); } catch (_) { /* validation already succeeded */ }
+  }
   const sessionToken = tokenFor(key, deviceId);
   sessions.set(sessionToken, { licenseKey: key, deviceId, expiresAt: Date.now() + sessionTtl * 1000 });
   return json(res, {
