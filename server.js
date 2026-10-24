@@ -8,7 +8,6 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const port = Number(process.env.PORT || 10000);
 const sessionTtl = Number(process.env.SESSION_TTL_SECONDS || 172800);
-const debugLogging = clean(process.env.DEBUG_LOGGING).toLowerCase() === 'true';
 const sessions = new Map();
 const state = new Map();
 const claimedWorkers = new Map();
@@ -21,44 +20,11 @@ app.use((req, _res, next) => {
   if (req.url.startsWith('//')) req.url = req.url.replace(/^\/+/, '/');
   next();
 });
-app.use((req, res, next) => {
-  const started = Date.now();
-  res.on('finish', () => logEvent('http_request', {
-    method: req.method,
-    path: req.path,
-    status_code: res.statusCode,
-    duration_ms: Date.now() - started,
-    action: clean(req.body?.action) || undefined,
-    body: safeBody(req.body),
-  }));
-  next();
-});
 
 function clean(value) { return String(value ?? '').trim(); }
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
 function json(res, body, status = 200) { return res.status(status).type('application/json').send(JSON.stringify(body)); }
 function error(res, message, status = 400) { return json(res, { status: false, success: false, message }, status); }
-function logEvent(event, fields = {}) {
-  if (!debugLogging) return;
-  console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...fields }));
-}
-
-function safeBody(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
-  const hidden = new Set(['token', 'authorization', 'license_key', 'device_id', 'ts', 'nonce', 'signature', 'claim_token', 'ts_token', 'savecity_data', 'master_file']);
-  const output = {};
-  for (const [key, value] of Object.entries(body)) {
-    const normalized = key.toLowerCase();
-    if (hidden.has(normalized) || normalized.includes('password') || normalized.includes('secret')) {
-      output[key] = '[redacted]';
-    } else if (typeof value === 'string' && value.length > 256) {
-      output[key] = `[string:${value.length} chars]`;
-    } else {
-      output[key] = value;
-    }
-  }
-  return output;
-}
 
 function configuredLicenses() {
   return clean(process.env.LICENSE_KEYS).split(',').map((entry) => entry.trim()).filter(Boolean).map((entry) => {
@@ -131,17 +97,67 @@ function deviceState(deviceId) {
   return state.get(deviceId);
 }
 function result(s, message = 'OK') {
-  return { status: true, success: true, message, account_count: s.account_count, prepared_count: s.workers.length, master_ready: s.master_ready, master_clan_id: '', master_uploaded_at: '', master: { ready: s.master_ready, clan_id: '', uploaded_at: '' }, master_meta: {}, job: s.job, logs: s.logs.slice(-180), workers: s.workers };
+  return { status: true, success: true, message, account_count: s.account_count, prepared_count: s.workers.length, master_ready: s.master_ready, master_clan_id: '', master_uploaded_at: '', job: s.job, logs: s.logs.slice(-180), workers: s.workers };
 }
 function addLog(s, message) { s.logs.push(`${new Date().toISOString()} ${message}`); s.logs = s.logs.slice(-500); s.job.last_message = message; }
 
 function workerPool() {
-  try {
-    const parsed = JSON.parse(process.env.WORKER_POOL_JSON || '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
+  const raw = clean(process.env.WORKER_POOL_JSON);
+  if (!raw) {
+    console.warn('WORKER_POOL_JSON is empty');
     return [];
   }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    console.warn('WORKER_POOL_JSON is not valid JSON');
+    return [];
+  }
+
+  const workers = Array.isArray(parsed)
+    ? parsed
+    : parsed && Array.isArray(parsed.workers)
+      ? parsed.workers
+      : null;
+
+  if (!workers) {
+    console.warn('WORKER_POOL_JSON must be an array or an object containing workers[]');
+    return [];
+  }
+
+  const seenIds = new Set();
+  const seenCities = new Set();
+  const validWorkers = [];
+
+  for (const worker of workers) {
+    if (!worker || typeof worker !== 'object' || Array.isArray(worker)) continue;
+
+    const workerId = clean(worker.worker_id);
+    const cityId = clean(worker.city_id);
+    if (!workerId || !cityId) {
+      console.warn('Ignoring worker with missing worker_id or city_id');
+      continue;
+    }
+
+    if (seenIds.has(workerId)) {
+      console.warn('Ignoring duplicate worker_id');
+      continue;
+    }
+
+    if (seenCities.has(cityId)) {
+      console.warn('Ignoring duplicate city_id');
+      continue;
+    }
+
+    seenIds.add(workerId);
+    seenCities.add(cityId);
+    validWorkers.push(worker);
+  }
+
+  console.log(`Loaded ${validWorkers.length} worker(s) from WORKER_POOL_JSON`);
+  return validWorkers;
 }
 
 app.get('/healthz', (_req, res) => json(res, { ok: true, service: 'bs-server', started_at: startedAt, uptime_seconds: Math.floor(process.uptime()) }));
@@ -150,7 +166,6 @@ app.get('/', (_req, res) => json(res, { service: 'bs-server', api: 'Dyluc Auto R
 function checkLicense(req, res) {
   const key = clean(req.body.license_key).toLowerCase();
   const deviceId = clean(req.body.device_id);
-  logEvent('license_check', { has_license_key: Boolean(key), has_device_id: Boolean(deviceId) });
   if (!key || !deviceId) return error(res, 'license_key and device_id are required');
   const license = findLicense(key);
   if (!license || license.expired) return json(res, { status: false, success: false, message: license?.expired ? 'License expired' : 'Invalid license' }, 403);
@@ -172,7 +187,6 @@ function checkLicense(req, res) {
 app.post('/srv/check_license.php', checkLicense);
 app.post('/c/12345', checkLicense);
 app.post('/c/*', checkLicense);
-app.all('/srv/regataonly_api/check_update.php', (_req, res) => json(res, { status: true, success: true, update_available: false, force_update: false, message: 'No update available' }));
 
 function autoRegata(req, res) {
   const endpoint = 'auto_regata.php';
@@ -180,7 +194,6 @@ function autoRegata(req, res) {
   if (!session) return;
   const s = deviceState(session.deviceId);
   const action = clean(req.body.action || 'status');
-  logEvent('auto_regata_action', { action });
   if (action === 'clear_log') { s.logs = []; return json(res, result(s, 'Logs cleared successfully.')); }
   if (action === 'status') return json(res, result(s));
   if (action === 'prepare_workers') {
@@ -221,54 +234,15 @@ function claimWorker(req, res) {
   const session = authOrError(req, res, 'claim.php');
   if (!session) return;
   const pool = workerPool();
-  if (!pool.length) {
-    logEvent('claim_result', { available: false, pool_count: 0, reason: 'empty_pool' });
-    return json(res, { status: true, available: false, message: 'No workers available in pool' });
-  }
-  const worker = pool.find((candidate) => {
-    const workerId = Number(candidate?.worker_id ?? candidate?.id);
-    const cityId = clean(candidate?.city_id || candidate?.cityId);
-    const tsToken = clean(candidate?.ts_token || candidate?.tsToken);
-    return Number.isInteger(workerId) && workerId > 0 && cityId !== '' && tsToken !== '' && !claimedWorkers.has(String(workerId));
-  });
-  if (!worker) {
-    logEvent('claim_result', { available: false, pool_count: pool.length, reason: 'no_valid_unclaimed_worker' });
-    return json(res, { status: true, success: true, available: false, message: 'No valid workers available in pool' });
-  }
+  if (!pool.length) return json(res, { status: true, available: false, message: 'No workers available in pool' });
+  const worker = pool.find((candidate) => !claimedWorkers.has(String(candidate.worker_id)));
+  if (!worker) return json(res, { status: true, available: false, message: 'No workers available in pool' });
   const claimToken = crypto.randomBytes(24).toString('hex');
-  const workerId = Number(worker.worker_id ?? worker.id);
-  claimedWorkers.set(String(workerId), { deviceId: session.deviceId, claimToken });
-  // The APK reads claim_token from WorkerItem.fromJson(worker). Keep it
-  // inside worker as well as at the top level for compatibility.
-  const responseWorker = {
-    ...worker,
-    worker_id: workerId,
-    claim_token: claimToken,
-    city_id: clean(worker.city_id || worker.cityId),
-    ts_bver: clean(worker.ts_bver || worker.bver || '39.0.5'),
-    ts_fver: clean(worker.ts_fver || worker.fver || '3900'),
-    ts_token: clean(worker.ts_token || worker.tsToken),
-  };
-  logEvent('claim_result', { available: true, pool_count: pool.length, worker_id: responseWorker.worker_id, has_city_id: Boolean(responseWorker.city_id), has_ts_token: Boolean(responseWorker.ts_token) });
-  return json(res, { status: true, success: true, available: true, claim_token: claimToken, worker: responseWorker });
+  claimedWorkers.set(String(worker.worker_id), { deviceId: session.deviceId, claimToken });
+  return json(res, { status: true, available: true, claim_token: claimToken, worker });
 }
 app.post('/srv/worker_api/claim.php', claimWorker);
 app.post('/claim.php', claimWorker);
-function consumeWorker(req, res) {
-  const session = authOrError(req, res, 'consume.php');
-  if (!session) return;
-  const workerId = clean(req.body.worker_id);
-  const claimToken = clean(req.body.claim_token);
-  const claim = claimedWorkers.get(workerId);
-  if (!claim || claim.deviceId !== session.deviceId || claim.claimToken !== claimToken) return error(res, 'Invalid or expired worker claim', 409);
-  claimedWorkers.delete(workerId);
-  const s = deviceState(session.deviceId);
-  s.workers = s.workers.filter((worker) => String(worker.worker_id) !== workerId);
-  addLog(s, `Worker consumed: ${workerId}`);
-  return json(res, { status: true, success: true, message: 'Worker consumed', workers: s.workers });
-}
-app.post('/srv/worker_api/consume.php', consumeWorker);
-app.post('/consume.php', consumeWorker);
 
 app.use((err, _req, res, _next) => { console.error(err); error(res, 'Internal server error', 500); });
 app.listen(port, '0.0.0.0', () => console.log(`bs-server listening on ${port}`));
